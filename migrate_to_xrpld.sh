@@ -74,6 +74,43 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# ── Resolve this script's own real path so the filesystem scan can skip it ────
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null \
+  || realpath "${BASH_SOURCE[0]}" 2>/dev/null \
+  || echo "${BASH_SOURCE[0]}")"
+
+# ── State file — tracks every file this script creates or modifies ────────────
+# On a subsequent run the list is loaded before the filesystem scan so those
+# files are automatically skipped and never re-processed.
+MIGRATE_STATE_FILE="/var/lib/rippled2xrpld/migrated-files"
+declare -a SCRIPT_MODIFIED_FILES=()
+
+load_migrated_files() {
+  [[ -f "$MIGRATE_STATE_FILE" ]] || return 0
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == "#"* ]] && continue
+    SCRIPT_MODIFIED_FILES+=("$line")
+  done < "$MIGRATE_STATE_FILE"
+  [[ ${#SCRIPT_MODIFIED_FILES[@]} -gt 0 ]] && \
+    info "Skipping ${#SCRIPT_MODIFIED_FILES[@]} file(s) previously modified by this script."
+}
+
+# record_modified_file <path>
+# Call this whenever the script creates or modifies a file so subsequent runs
+# can skip it during the filesystem scan.
+record_modified_file() {
+  local filepath="$1"
+  [[ -z "$filepath" ]] && return
+  # Avoid duplicates
+  local f; for f in "${SCRIPT_MODIFIED_FILES[@]}"; do
+    [[ "$f" == "$filepath" ]] && return
+  done
+  SCRIPT_MODIFIED_FILES+=("$filepath")
+  mkdir -p "$(dirname "$MIGRATE_STATE_FILE")" 2>/dev/null || true
+  echo "$filepath" >> "$MIGRATE_STATE_FILE" 2>/dev/null || true
+}
+
 # ── Change log (populated throughout the script; printed at the end) ──────────
 declare -a CHANGE_LOG=()
 
@@ -418,7 +455,20 @@ detect_installation() {
   fi
 
   if [[ -z "$INSTALL_METHOD" ]]; then
-    die "rippled not found on this system. Nothing to migrate."
+    # rippled not found — check if xrpld is already installed.
+    # This happens when the migration was done previously (possibly partially)
+    # or the user already installed xrpld manually.  We still proceed so the
+    # script can patch the unit file config path and verify the service.
+    if command -v xrpld &>/dev/null 2>&1 \
+       || [[ -x /opt/xrpld/bin/xrpld ]] \
+       || [[ -x /usr/bin/xrpld ]]; then
+      warn "rippled not found, but xrpld is already installed."
+      warn "Skipping uninstall/install steps — will only patch config and service."
+      INSTALL_METHOD="already_migrated"
+      RIPPLED_BIN="(already removed)"
+    else
+      die "rippled not found on this system. Nothing to migrate."
+    fi
   fi
 
   # Sanity-check: if pkg reported a path that isn't executable, fall back to PATH
@@ -512,6 +562,15 @@ detect_config() {
 
 detect_config
 
+# Load files previously modified by this script so the scan can skip them
+load_migrated_files
+
+# Lock in the config path NOW, before any package installation runs.
+# The xrpld package will drop a new default config (e.g. /etc/xrpld/xrpld.cfg);
+# by capturing the pre-existing path here we ensure that file is never used
+# in place of the operator's real config.
+XRPLD_CONFIG_FILE="${CONFIG_FILE:-}"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4 — Detect startup method
 # ─────────────────────────────────────────────────────────────────────────────
@@ -523,14 +582,24 @@ LAUNCHD_PLIST=""
 LAUNCHD_PLIST_PATH=""
 
 detect_startup() {
-  # systemd
+  # systemd — check for rippled.service first, then fall back to xrpld.service
+  # (xrpld already present / rippled already removed from a prior partial run)
   if command -v systemctl &>/dev/null 2>&1; then
-    if systemctl list-unit-files "${SERVICE_NAME}.service" &>/dev/null 2>&1 \
-       && systemctl list-unit-files "${SERVICE_NAME}.service" | grep -q rippled; then
+    if systemctl list-unit-files "${SERVICE_NAME}.service" 2>/dev/null \
+       | grep -q rippled; then
       START_METHOD="systemd"
       info "Startup  : systemd (unit: ${SERVICE_NAME}.service)"
       local state
       state="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo inactive)"
+      info "State    : ${state}"
+      return
+    fi
+    # rippled.service not present — check if xrpld.service already exists
+    if systemctl list-unit-files "xrpld.service" 2>/dev/null | grep -q xrpld; then
+      START_METHOD="systemd"
+      info "Startup  : systemd (unit: xrpld.service — xrpld already installed)"
+      local state
+      state="$(systemctl is-active xrpld 2>/dev/null || echo inactive)"
       info "State    : ${state}"
       return
     fi
@@ -915,8 +984,11 @@ scan_directory() {
 
   info "Scanning ${label} (${scan_dir})..."
 
-  # Build skip-list
+  # Build skip-list: this script itself, files previously modified by this script,
+  # and files already handled by dedicated migration steps (logrotate, cron, monitoring).
   local -a already_handled=()
+  [[ -n "$SCRIPT_SELF"    ]] && already_handled+=("$SCRIPT_SELF")
+  already_handled+=("${SCRIPT_MODIFIED_FILES[@]}")
   [[ -n "$LOGROTATE_FILE" ]] && already_handled+=("$LOGROTATE_FILE")
   already_handled+=("${CRON_FILES_WITH_RIPPLED[@]}")
   already_handled+=("${MONITORING_FILES_WITH_RIPPLED[@]}")
@@ -1057,8 +1129,8 @@ fi
 if [[ -n "$LOGROTATE_FILE" ]]; then
   echo -e "  ${BOLD}logrotate       :${RESET} ${LOGROTATE_FILE}"
 fi
-local scan_auto=$(( ${#SCAN_NAME_REFS[@]} + ${#SCAN_SCRIPT_REFS[@]} + ${#SCAN_LOG_PATH_REFS[@]} ))
-local scan_review=${#SCAN_UNKNOWN_REFS[@]}
+scan_auto=$(( ${#SCAN_NAME_REFS[@]} + ${#SCAN_SCRIPT_REFS[@]} + ${#SCAN_LOG_PATH_REFS[@]} ))
+scan_review=${#SCAN_UNKNOWN_REFS[@]}
 echo -e "  ${BOLD}Filesystem scan  :${RESET} ${scan_auto} file(s) auto-fixable, ${scan_review} need manual review"
 echo ""
 echo -e "  ${BOLD}Plan:${RESET}"
@@ -1127,6 +1199,9 @@ header "Uninstalling rippled"
 
 uninstall_rippled() {
   case "$INSTALL_METHOD" in
+    already_migrated)
+      info "rippled was already removed — skipping uninstall step."
+      ;;
     rpm)
       info "Removing RPM package: ${RIPPLED_PKG_NAME}"
       # --nodeps avoids pulling down dependent packages; RPM does NOT remove
@@ -1426,36 +1501,64 @@ XRPLD_DEB_REPO_KEY="${XRPLD_DEB_REPO_KEY:-https://repos.ripple.com/repos/xrpld-d
 XRPLD_BREW_TAP="${XRPLD_BREW_TAP:-ripple/tap}"
 
 install_xrpld() {
+  # If xrpld was already present before this run (partial migration), skip
+  # the package install but still verify the binary and patch the unit file.
+  if [[ "$INSTALL_METHOD" == "already_migrated" ]]; then
+    local xrpld_bin
+    xrpld_bin="$(command -v xrpld 2>/dev/null \
+      || { [[ -x /opt/xrpld/bin/xrpld ]] && echo /opt/xrpld/bin/xrpld; } \
+      || true)"
+    [[ -z "$xrpld_bin" ]] && die "xrpld binary not found in PATH."
+    local xver
+    xver="$("$xrpld_bin" --version 2>/dev/null | head -1 || echo 'unknown')"
+    info "xrpld already installed: ${xrpld_bin}  (${xver})"
+    info "Skipping package install — will proceed to config and service patching."
+    return
+  fi
+
   case "$PKG_MANAGER" in
 
     # ── APT (Ubuntu / Debian) ─────────────────────────────────────────────────
     apt)
-      info "Configuring Ripple APT repository for xrpld..."
-      apt-get install -y curl gnupg2 lsb-release ca-certificates \
-        || die "Failed to install prerequisites"
+      # If the xrpld package is already known to apt (repo pre-configured), skip
+      # repo setup entirely — attempting to re-add it would fetch a GPG key that
+      # may not exist at the placeholder URL and fail unnecessarily.
+      if apt-cache show xrpld &>/dev/null; then
+        info "xrpld already available in apt cache — skipping repo configuration."
+      else
+        info "Configuring Ripple APT repository for xrpld..."
+        apt-get install -y curl gnupg2 lsb-release ca-certificates \
+          || die "Failed to install prerequisites"
 
-      local codename
-      codename="$(lsb_release -sc 2>/dev/null || echo 'focal')"
+        local codename
+        codename="$(lsb_release -sc 2>/dev/null || echo 'focal')"
 
-      # Import signing key
-      curl -fsSL "${XRPLD_DEB_REPO_KEY}" \
-        | gpg --dearmor -o /usr/share/keyrings/xrpld-archive-keyring.gpg \
-        || die "Failed to import xrpld GPG key"
+        # Import signing key
+        curl -fsSL "${XRPLD_DEB_REPO_KEY}" \
+          | gpg --dearmor -o /usr/share/keyrings/xrpld-archive-keyring.gpg \
+          || die "Failed to import xrpld GPG key"
 
-      # Add repo
-      echo "deb [signed-by=/usr/share/keyrings/xrpld-archive-keyring.gpg] \
+        # Add repo
+        echo "deb [signed-by=/usr/share/keyrings/xrpld-archive-keyring.gpg] \
 ${XRPLD_DEB_REPO_URL} ${codename} stable" \
-        > /etc/apt/sources.list.d/xrpld.list
+          > /etc/apt/sources.list.d/xrpld.list
+        record_modified_file "/etc/apt/sources.list.d/xrpld.list"
+        record_modified_file "/usr/share/keyrings/xrpld-archive-keyring.gpg"
 
-      apt-get update -qq || die "apt-get update failed"
+        apt-get update -qq || die "apt-get update failed"
+      fi
+
       DEBIAN_FRONTEND=noninteractive apt-get install -y xrpld \
         || die "apt-get install xrpld failed"
       ;;
 
     # ── YUM (CentOS / RHEL / Amazon Linux) ───────────────────────────────────
     yum)
-      info "Configuring Ripple YUM repository for xrpld..."
-      cat > /etc/yum.repos.d/xrpld.repo <<EOF
+      if yum info xrpld &>/dev/null; then
+        info "xrpld already available in yum — skipping repo configuration."
+      else
+        info "Configuring Ripple YUM repository for xrpld..."
+        cat > /etc/yum.repos.d/xrpld.repo <<EOF
 [xrpld-stable]
 name=xrpld Stable
 baseurl=${XRPLD_RPM_REPO_URL}
@@ -1463,13 +1566,18 @@ enabled=1
 gpgcheck=1
 gpgkey=${XRPLD_RPM_REPO_URL}/repodata/repomd.xml.key
 EOF
+        record_modified_file "/etc/yum.repos.d/xrpld.repo"
+      fi
       yum install -y xrpld || die "yum install xrpld failed"
       ;;
 
     # ── DNF (Fedora / CentOS 8+ / RHEL 8+) ───────────────────────────────────
     dnf)
-      info "Configuring Ripple DNF repository for xrpld..."
-      cat > /etc/yum.repos.d/xrpld.repo <<EOF
+      if dnf info xrpld &>/dev/null; then
+        info "xrpld already available in dnf — skipping repo configuration."
+      else
+        info "Configuring Ripple DNF repository for xrpld..."
+        cat > /etc/yum.repos.d/xrpld.repo <<EOF
 [xrpld-stable]
 name=xrpld Stable
 baseurl=${XRPLD_RPM_REPO_URL}
@@ -1477,6 +1585,8 @@ enabled=1
 gpgcheck=1
 gpgkey=${XRPLD_RPM_REPO_URL}/repodata/repomd.xml.key
 EOF
+        record_modified_file "/etc/yum.repos.d/xrpld.repo"
+      fi
       dnf install -y xrpld || die "dnf install xrpld failed"
       ;;
 
@@ -1522,18 +1632,59 @@ install_xrpld
 # ─────────────────────────────────────────────────────────────────────────────
 header "Config file — keeping in place"
 
-XRPLD_CONFIG_FILE=""
-
 handle_config() {
-  if [[ -z "$CONFIG_FILE" ]]; then
-    warn "No rippled config file was found."
-    warn "xrpld will start with compiled defaults — create a config manually if needed."
-    return
-  fi
+  # Scan for any new default config dropped by the xrpld package install.
+  local new_pkg_configs=(
+    "/etc/opt/xrpld/xrpld.cfg"
+    "/etc/xrpld/xrpld.cfg"
+    "/etc/xrpld/rippled.cfg"
+    "/opt/ripple/etc/xrpld.cfg"
+    "/opt/xrpld/etc/xrpld.cfg"
+    "/usr/local/etc/xrpld/xrpld.cfg"
+  )
+  local new_pkg_config=""
+  local nc
+  for nc in "${new_pkg_configs[@]}"; do
+    if [[ -f "$nc" && "$nc" != "$XRPLD_CONFIG_FILE" ]]; then
+      new_pkg_config="$nc"
+      break
+    fi
+  done
 
-  XRPLD_CONFIG_FILE="$CONFIG_FILE"
-  success "Config stays at existing path: ${XRPLD_CONFIG_FILE}"
-  info "(No files will be moved or renamed.)"
+  if [[ -n "$XRPLD_CONFIG_FILE" ]]; then
+    # Pre-existing config found before install — always use it.
+    success "Config stays at existing path: ${XRPLD_CONFIG_FILE}"
+    if [[ -n "$new_pkg_config" ]]; then
+      info "Package created a new default config at: ${new_pkg_config}"
+      # Replace the package default with a symlink → real config so that
+      # xrpld picks up the right config regardless of how it is invoked
+      # (e.g. if the unit file --conf is ever reset to the package default).
+      info "Replacing ${new_pkg_config} with a symlink → ${XRPLD_CONFIG_FILE}"
+      cp -p "$new_pkg_config" "${new_pkg_config}.bak-pkg" 2>/dev/null || true
+      if ln -sf "$XRPLD_CONFIG_FILE" "$new_pkg_config" 2>/dev/null; then
+        success "Symlink created: ${new_pkg_config} → ${XRPLD_CONFIG_FILE}"
+        record_change "CONFIG SYMLINK" "${new_pkg_config} → ${XRPLD_CONFIG_FILE}"
+        record_modified_file "$new_pkg_config"
+        record_modified_file "${new_pkg_config}.bak-pkg"
+      else
+        warn "Could not create symlink at ${new_pkg_config}."
+        warn "The package default config remains at that path."
+        warn "To fix manually: ln -sf ${XRPLD_CONFIG_FILE} ${new_pkg_config}"
+        record_change "CONFIG SKIP" \
+          "Ignored new package config ${new_pkg_config} — using ${XRPLD_CONFIG_FILE}"
+      fi
+    fi
+    info "(Config file is not moved or renamed.)"
+  elif [[ -n "$new_pkg_config" ]]; then
+    # No pre-existing config, but the package created one — use it as a starting point.
+    XRPLD_CONFIG_FILE="$new_pkg_config"
+    warn "No pre-existing rippled.cfg was found."
+    warn "Using new package config as starting point: ${XRPLD_CONFIG_FILE}"
+    warn "Review and customise it before relying on it in production."
+  else
+    warn "No config file found. xrpld will start with compiled defaults."
+    warn "Create a config and re-run, or pass --config-dir to specify its location."
+  fi
 }
 
 handle_config
@@ -1569,8 +1720,39 @@ handle_config
 # ─────────────────────────────────────────────────────────────────────────────
 header "Validating config paths against filesystem"
 
-# Populated by parse_config_paths:
-declare -A CFG_PATH_ENTRIES=()   # key (section:field) → absolute path value
+# Populated by parse_config_paths.
+# CFG_PATH_ENTRIES is the only associative array needed — the next available
+# index for any prefix is derived on-the-fly by counting existing keys, which
+# avoids the Bash bug where =() inside a function shadows a global declare -A.
+declare -A CFG_PATH_ENTRIES=()   # "section:field:N" → absolute path value
+_cfg_current_section=""          # current section name (lower-case)
+_cfg_section_lines=()            # bare lines accumulated for current section
+
+# Return the next unused integer suffix for a given key prefix in CFG_PATH_ENTRIES.
+# Usage: _cfg_next_idx "section:field"  → echoes the next index (0, 1, 2, …)
+_cfg_next_idx() {
+  local prefix="$1"
+  local idx=0
+  local k
+  for k in "${!CFG_PATH_ENTRIES[@]}"; do
+    [[ "$k" == "${prefix}:"* ]] && (( idx++ )) || true
+  done
+  echo "$idx"
+}
+
+# ── Helper: flush accumulated bare-path lines for the current section ─────────
+_flush_section_body() {
+  local ln
+  for ln in "${_cfg_section_lines[@]}"; do
+    ln="${ln#"${ln%%[![:space:]]*}"}"   # ltrim without subshell
+    if [[ "$ln" == /* ]]; then
+      local idx
+      idx="$(_cfg_next_idx "${_cfg_current_section}:body")"
+      CFG_PATH_ENTRIES["${_cfg_current_section}:body:${idx}"]="$ln"
+    fi
+  done
+  _cfg_section_lines=()
+}
 
 # ── Parse rippled.cfg for all absolute path values ────────────────────────────
 parse_config_paths() {
@@ -1579,66 +1761,48 @@ parse_config_paths() {
     return
   }
 
-  local current_section=""
-  local section_lines=()    # accumulate non-key lines inside a section
-
-  # Counter used to make unique keys when the same section appears more than
-  # once (e.g. multiple [node_db] blocks for NuDB + RocksDB).
-  local -A section_count=()
-
-  flush_section_body() {
-    # After we've collected all lines in a section, check if the body is a
-    # bare absolute path (e.g. [database_path] whose only content is a path).
-    local idx="${section_count[$current_section]:-0}"
-    for ln in "${section_lines[@]}"; do
-      ln="$(echo "$ln" | sed 's/^[[:space:]]*//')"
-      if [[ "$ln" == /* ]]; then
-        # Append an index so duplicate sections don't overwrite each other
-        CFG_PATH_ENTRIES["${current_section}:body:${idx}"]="$ln"
-        (( idx++ )) || true
-      fi
-    done
-    section_count[$current_section]=$idx
-    section_lines=()
-  }
+  # Reset shared state (plain assignments — no associative array ops)
+  CFG_PATH_ENTRIES=()
+  _cfg_current_section=""
+  _cfg_section_lines=()
 
   while IFS= read -r raw_line; do
     # Strip inline comments and trailing whitespace
     local line
-    line="$(echo "$raw_line" | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//')"
+    line="${raw_line%%#*}"                      # drop inline comment
+    line="${line%"${line##*[![:space:]]}"}"     # rtrim
+
     [[ -z "$line" ]] && continue
 
     # Section header
     if [[ "$line" =~ ^\[([^\]]+)\] ]]; then
-      flush_section_body
-      current_section="${BASH_REMATCH[1],,}"   # lower-case
+      _flush_section_body
+      _cfg_current_section="${BASH_REMATCH[1],,}"   # lower-case
       continue
     fi
 
-    # key = value  (look for any key whose value looks like an absolute path)
+    # key = value  (only capture values that look like absolute paths)
     if [[ "$line" =~ ^[[:space:]]*([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(/.+) ]]; then
       local key="${BASH_REMATCH[1],,}"
       local val="${BASH_REMATCH[2]}"
-      # Keys that carry paths:
       case "$key" in
         path|db_path|database_path|log_file|logfile|debug_logfile|\
         validators_file|validator_key_file|peer_private_key_file)
-          # Use a counter suffix so duplicate sections (e.g. multiple [node_db])
-          # don't silently overwrite each other.
-          local kidx="${section_count[${current_section}:${key}]:-0}"
-          CFG_PATH_ENTRIES["${current_section}:${key}:${kidx}"]="$val"
-          section_count["${current_section}:${key}"]=$(( kidx + 1 ))
+          local kidx
+          kidx="$(_cfg_next_idx "${_cfg_current_section}:${key}")"
+          CFG_PATH_ENTRIES["${_cfg_current_section}:${key}:${kidx}"]="$val"
           ;;
       esac
       continue
     fi
 
-    # Collect bare lines for flush_section_body
-    section_lines+=("$line")
+    # Collect bare lines for _flush_section_body
+    _cfg_section_lines+=("$line")
 
   done < "$XRPLD_CONFIG_FILE"
 
-  flush_section_body
+  # Flush the final section
+  _flush_section_body
 }
 
 # ── Validate + sync ───────────────────────────────────────────────────────────
@@ -1662,8 +1826,26 @@ validate_config_paths() {
     # Strip glob/wildcard suffixes for existence check (e.g. /path/*.log)
     local check_path="${cfg_path%%\**}"
     check_path="${check_path%/}"
+
+    # Determine whether this entry is a file path or a directory path so we
+    # know whether to mkdir the path itself or just its parent.
+    # File keys: debug_logfile, log_file, logfile, validators_file, *_key_file
+    # Directory keys: path, db_path, database_path, database_path section body
+    local is_file_path=false
+    case "$entry_key" in
+      *debug_logfile*|*log_file*|*logfile*|*validators_file*|*validator_key_file*|*peer_private*)
+        is_file_path=true ;;
+    esac
+
+    local mkdir_target
+    if $is_file_path; then
+      mkdir_target="$(dirname "$check_path")"
+    else
+      mkdir_target="$check_path"
+    fi
+
     local parent_dir
-    parent_dir="$(dirname "$check_path")"
+    parent_dir="$(dirname "$mkdir_target")"
 
     printf "  %-45s " "${entry_key} = ${cfg_path}"
 
@@ -1671,28 +1853,44 @@ validate_config_paths() {
     if [[ -e "$check_path" ]]; then
       echo -e "${GREEN}EXISTS${RESET}"
 
-    elif [[ -e "${check_path%.*}" ]]; then
-      # File path where extension was stripped — close enough
-      echo -e "${GREEN}EXISTS (parent ok)${RESET}"
+    elif $is_file_path && [[ -d "$mkdir_target" ]]; then
+      # Log file doesn't exist yet but its parent directory does — that's fine
+      echo -e "${GREEN}DIR EXISTS${RESET}"
 
     else
       echo -e "${RED}MISSING${RESET}"
       warn "  Path does not exist: ${cfg_path}"
 
-      # Whether the parent exists or not, we use mkdir -p to create the full
-      # path tree. This is a required action in all modes — xrpld will not
-      # start without the paths its config declares.
       if [[ ! -d "$parent_dir" ]]; then
         warn "  Parent directory also missing: ${parent_dir}"
         warn "  Will attempt to create full path tree with mkdir -p."
       fi
 
-      if ask_yes_no "  Create missing directory (full path): ${check_path}?" yes; then
-        mkdir -p "$check_path" \
-          && { success "  Created: ${check_path}"
-               record_change "DIR CREATED" "${check_path} (required by config)"; } \
-          || { warn "  Could not create ${check_path}"
-               warn "  xrpld may fail to start — ensure this path exists before proceeding."; }
+      local mkdir_prompt
+      if $is_file_path; then
+        mkdir_prompt="  Create missing parent directory for log/config file: ${mkdir_target}?"
+      else
+        mkdir_prompt="  Create missing directory: ${mkdir_target}?"
+      fi
+
+      if ask_yes_no "$mkdir_prompt" yes; then
+        if mkdir -p "$mkdir_target"; then
+          # Set ownership to xrpld:xrpld so the daemon can read/write the path.
+          # Fall back gracefully if the xrpld user does not exist yet.
+          if id -u xrpld &>/dev/null 2>&1; then
+            chown -R xrpld:xrpld "$mkdir_target" 2>/dev/null \
+              && info  "  Ownership set to xrpld:xrpld: ${mkdir_target}" \
+              || warn  "  chown xrpld:xrpld failed for ${mkdir_target} — set it manually."
+          else
+            warn "  xrpld user not found — skipping chown. Set ownership manually after install:"
+            warn "  chown -R xrpld:xrpld ${mkdir_target}"
+          fi
+          success "  Created: ${mkdir_target}"
+          record_change "DIR CREATED" "${mkdir_target} (required by config, owned by xrpld:xrpld)"
+        else
+          warn "  Could not create ${mkdir_target}"
+          warn "  xrpld may fail to start — ensure this path exists before proceeding."
+        fi
       fi
     fi
 
@@ -1710,10 +1908,6 @@ validate_config_paths() {
 
       # Directory rename is optional/risky — skip in --auto mode
       if ask_optional "  Rename directory and update config to use '${new_cfg_path}'?" no; then
-        local old_dir new_dir
-        old_dir="$(echo "$dir_part" | sed 's|/rippled\(/\|$\)|/rippled|')"
-        new_dir="$(echo "$dir_part" | sed 's|/rippled\(/\|$\)|/xrpld|g')"
-
         # Resolve to the top-most rippled→xrpld directory to rename
         # (avoids renaming nested subdirs one by one)
         local rename_from rename_to
@@ -1725,17 +1919,49 @@ validate_config_paths() {
         elif [[ -e "$rename_to" ]]; then
           warn "  Target already exists: ${rename_to}"
           warn "  Updating config to point there without renaming."
-          old_paths+=("$cfg_path")
-          new_paths+=("$new_cfg_path")
+          # Collect ALL entries with this prefix into old/new rewrite lists
+          # and update CFG_PATH_ENTRIES in one pass so later iterations are correct.
+          local k v
+          for k in "${!CFG_PATH_ENTRIES[@]}"; do
+            v="${CFG_PATH_ENTRIES[$k]}"
+            if [[ "$v" == "${rename_from}"* ]]; then
+              old_paths+=("$v")
+              new_paths+=("${rename_to}${v#"$rename_from"}")
+              CFG_PATH_ENTRIES["$k"]="${rename_to}${v#"$rename_from"}"
+            fi
+          done
         else
           info "  Renaming: ${rename_from} → ${rename_to}"
-          mv "$rename_from" "$rename_to" \
-            && { success "  Directory renamed."
-                 record_change "DIR RENAMED" "${rename_from} → ${rename_to}"; } \
-            || { warn "  mv failed — config will NOT be updated."; continue; }
+          if mv "$rename_from" "$rename_to"; then
+            # Set ownership on the renamed tree so xrpld can read/write it.
+            if id -u xrpld &>/dev/null 2>&1; then
+              chown -R xrpld:xrpld "$rename_to" 2>/dev/null \
+                && info  "  Ownership set to xrpld:xrpld: ${rename_to}" \
+                || warn  "  chown xrpld:xrpld failed for ${rename_to} — set it manually."
+            else
+              warn "  xrpld user not found — set ownership manually:"
+              warn "  chown -R xrpld:xrpld ${rename_to}"
+            fi
+            success "  Directory renamed."
+            record_change "DIR RENAMED" "${rename_from} → ${rename_to} (owned by xrpld:xrpld)"
+          else
+            warn "  mv failed — config will NOT be updated."; continue
+          fi
 
-          old_paths+=("$cfg_path")
-          new_paths+=("$new_cfg_path")
+          # Collect ALL entries sharing the renamed prefix into the rewrite lists
+          # AND update CFG_PATH_ENTRIES so subsequent loop iterations see the new
+          # paths. This ensures every config entry (not just the current one) gets
+          # rewritten — e.g. both [database_path] and [debug_logfile] under the
+          # same /space/rippled/ root are handled in one rename.
+          local k v
+          for k in "${!CFG_PATH_ENTRIES[@]}"; do
+            v="${CFG_PATH_ENTRIES[$k]}"
+            if [[ "$v" == "${rename_from}"* ]]; then
+              old_paths+=("$v")
+              new_paths+=("${rename_to}${v#"$rename_from"}")
+              CFG_PATH_ENTRIES["$k"]="${rename_to}${v#"$rename_from"}"
+            fi
+          done
 
           # Symlink is optional — skip in --auto mode
           if ask_optional "  Create symlink ${rename_from} → ${rename_to} for compatibility?" yes; then
@@ -1781,6 +2007,49 @@ validate_config_paths() {
 
   echo ""
   success "Config path validation complete."
+
+  # ── Set ownership of all config-declared paths to xrpld:xrpld ───────────────
+  # This covers paths that existed before (never renamed), paths that were just
+  # renamed, and paths that were just created — so the daemon can always
+  # read/write them regardless of what the previous rippled ownership was.
+  header "Setting xrpld:xrpld ownership on data/log paths"
+  if id -u xrpld &>/dev/null 2>&1; then
+    local seen_dirs=()
+    for entry_key in $(echo "${!CFG_PATH_ENTRIES[@]}" | tr ' ' '\n' | sort); do
+      local raw_path="${CFG_PATH_ENTRIES[$entry_key]}"
+      # For file-type entries chown the parent directory; for directory entries
+      # chown the directory itself.
+      local chown_target
+      local is_fp=false
+      case "$entry_key" in
+        *debug_logfile*|*log_file*|*logfile*|*validators_file*|*validator_key_file*|*peer_private*)
+          is_fp=true ;;
+      esac
+      if $is_fp; then
+        chown_target="$(dirname "${raw_path%%\**}")"
+      else
+        chown_target="${raw_path%%\**}"
+        chown_target="${chown_target%/}"
+      fi
+
+      # Skip if already handled or doesn't exist
+      [[ -z "$chown_target" || ! -e "$chown_target" ]] && continue
+      local already=false
+      local d; for d in "${seen_dirs[@]:-}"; do
+        [[ "$d" == "$chown_target" ]] && { already=true; break; }
+      done
+      $already && continue
+      seen_dirs+=("$chown_target")
+
+      chown -R xrpld:xrpld "$chown_target" 2>/dev/null \
+        && { success "  xrpld:xrpld  ${chown_target}"
+             record_change "CHOWN" "xrpld:xrpld ${chown_target}"; } \
+        || warn "  chown failed for ${chown_target} — set it manually: chown -R xrpld:xrpld ${chown_target}"
+    done
+  else
+    warn "xrpld system user not found — cannot set ownership now."
+    warn "After install, run:  chown -R xrpld:xrpld <each data/log directory>"
+  fi
 }
 
 validate_config_paths
@@ -1817,6 +2086,8 @@ migrate_cron_jobs() {
 
     success "  ${f} updated."
     record_change "CRON" "rippled → xrpld in ${f}"
+    record_modified_file "$f"
+    record_modified_file "${f}.bak-rippled"
   done
 }
 
@@ -1851,6 +2122,8 @@ migrate_monitoring_configs() {
 
     success "  ${f} updated."
     record_change "MONITORING" "rippled → xrpld in ${f}"
+    record_modified_file "$f"
+    record_modified_file "${f}.bak-rippled"
   done
 
   # Reload monitoring daemons that are active
@@ -1897,6 +2170,7 @@ migrate_logrotate() {
   info "Updating: ${LOGROTATE_FILE}"
   cp -p "${LOGROTATE_FILE}" "${LOGROTATE_FILE}.bak-rippled" \
     && info "Backed up as ${LOGROTATE_FILE}.bak-rippled"
+  record_modified_file "${LOGROTATE_FILE}.bak-rippled"
 
   # What we rewrite:
   #   1. The drop-in filename itself (handled by the rename below)
@@ -1929,14 +2203,18 @@ migrate_logrotate() {
   base="$(basename "${LOGROTATE_FILE}")"
   if [[ "$base" == "rippled" || "$base" == *"rippled"* ]]; then
     new_path="${dir}/$(echo "$base" | sed 's/rippled/xrpld/g')"
+    local old_lf="$LOGROTATE_FILE"
     mv "${LOGROTATE_FILE}" "${new_path}" \
-      && { success "Renamed: ${LOGROTATE_FILE} → ${new_path}"
-           record_change "LOGROTATE" "renamed ${LOGROTATE_FILE} → ${new_path}"; } \
+      && { success "Renamed: ${old_lf} → ${new_path}"
+           record_change "LOGROTATE" "renamed ${old_lf} → ${new_path}"
+           record_modified_file "$old_lf"
+           record_modified_file "$new_path"; } \
       || warn "Could not rename logrotate file — update it manually."
     LOGROTATE_FILE="$new_path"
   else
     success "logrotate config updated: ${LOGROTATE_FILE}"
     record_change "LOGROTATE" "updated ${LOGROTATE_FILE}"
+    record_modified_file "${LOGROTATE_FILE}"
   fi
 
   # Warn if the old log directory still exists — xrpld will write to the new
@@ -1990,7 +2268,9 @@ migrate_scan_results() {
       apply_fix "$filepath" \
         perl -i -pe 's{(?<!/)\brippled\b}{xrpld}g' "$filepath" \
         && { success "  Fixed: ${filepath}"
-             record_change "NAME REF" "rippled → xrpld in ${filepath}"; } \
+             record_change "NAME REF" "rippled → xrpld in ${filepath}"
+             record_modified_file "$filepath"
+             record_modified_file "${filepath}.bak-rippled"; } \
         || warn    "  Could not fix: ${filepath} — edit manually"
     done
   else
@@ -2007,7 +2287,9 @@ migrate_scan_results() {
           s{(?<!/)\brippled\b}{xrpld}g;
         ' "$filepath" \
         && { success "  Fixed: ${filepath}"
-             record_change "SCRIPT" "rippled → xrpld in ${filepath}"; } \
+             record_change "SCRIPT" "rippled → xrpld in ${filepath}"
+             record_modified_file "$filepath"
+             record_modified_file "${filepath}.bak-rippled"; } \
         || warn    "  Could not fix: ${filepath} — edit manually"
     done
   else
@@ -2024,7 +2306,9 @@ migrate_scan_results() {
           -e 's|/var/log/ripple/|/var/log/xrpld/|g' \
           "$filepath" \
         && { success "  Fixed: ${filepath}"
-             record_change "LOG PATH" "/var/log/rippled → /var/log/xrpld in ${filepath}"; } \
+             record_change "LOG PATH" "/var/log/rippled → /var/log/xrpld in ${filepath}"
+             record_modified_file "$filepath"
+             record_modified_file "${filepath}.bak-rippled"; } \
         || warn    "  Could not fix: ${filepath}"
     done
   else
@@ -2042,27 +2326,45 @@ migrate_scan_results() {
     done
   fi
 
-  # ── UNKNOWN refs — pause and ask operator ─────────────────────────────────
+  # ── UNKNOWN refs — show each match and ask whether to apply rippled→xrpld ───
   if [[ $total_unk -gt 0 ]]; then
     echo ""
-    warn "═══ MANUAL REVIEW REQUIRED ══════════════════════════════════════════"
-    warn "${total_unk} file(s) have references that could not be auto-classified."
-    warn "Each line is shown below. Decide if 'rippled' should become 'xrpld'."
+    warn "═══ UNKNOWN REFERENCES — REVIEW REQUIRED ════════════════════════════"
+    warn "${total_unk} file(s) contain references that could not be auto-classified."
     echo ""
-    for filepath in "${!SCAN_UNKNOWN_REFS[@]}"; do
-      warn "  File: ${filepath}"
-      while IFS= read -r ln; do
-        [[ -n "$ln" ]] && warn "    ${ln}"
-      done <<< "${SCAN_UNKNOWN_REFS[$filepath]}"
-    done
+
+    if $AUTO_MODE; then
+      warn "AUTO MODE: skipping unknown refs — review these files after migration:"
+      for filepath in "${!SCAN_UNKNOWN_REFS[@]}"; do
+        warn "  ${filepath}"
+      done
+    else
+      for filepath in "${!SCAN_UNKNOWN_REFS[@]}"; do
+        echo ""
+        info "File: ${filepath}"
+        # Print the matching lines with context so the operator can decide
+        while IFS= read -r ln; do
+          [[ -n "$ln" ]] && echo -e "    ${YELLOW}${ln}${RESET}"
+        done <<< "${SCAN_UNKNOWN_REFS[$filepath]}"
+        echo ""
+
+        if ask_yes_no "  Replace 'rippled' → 'xrpld' in ${filepath}?" no; then
+          apply_fix "$filepath" \
+            perl -i -pe 's{(?<!/)\brippled\b}{xrpld}g' "$filepath" \
+            && { success "  Fixed: ${filepath}"
+                 record_change "UNKNOWN FIX" "rippled → xrpld in ${filepath}"
+                 record_modified_file "$filepath"
+                 record_modified_file "${filepath}.bak-rippled"; } \
+            || warn "  Could not fix: ${filepath} — edit manually"
+        else
+          info "  Skipped — edit ${filepath} manually if needed."
+          record_change "UNKNOWN SKIP" "manual review needed: ${filepath}"
+        fi
+      done
+    fi
+
     warn "═════════════════════════════════════════════════════════════════════"
     echo ""
-    if $AUTO_MODE; then
-      warn "AUTO MODE: continuing past unknown refs — review the files above after migration."
-    elif ! ask_yes_no "Continue migration (fix the above files later)?" yes; then
-      info "Aborted. Fix the files above and re-run."
-      exit 0
-    fi
   fi
 }
 
@@ -2096,38 +2398,59 @@ start_xrpld() {
         warn "XRPLD_CONFIG_FILE is not set — xrpld will start with its compiled-in default config."
         warn "Verify the correct config path and either re-run this script or create a drop-in:"
         warn "  mkdir -p /etc/systemd/system/xrpld.service.d"
-        warn "  printf '[Service]\\nExecStart=\\nExecStart=/usr/bin/xrpld --conf /etc/xrpld/xrpld.cfg\\n' \\"
+        # Derive hint binary from unit file if already found, else fall back to known path
+        local _hint_bin2
+        _hint_bin2="$(grep -m1 '^[[:space:]]*ExecStart=' "${unit_file:-/dev/null}" 2>/dev/null \
+          | sed 's/^[[:space:]]*ExecStart=//' | awk '{print $1}')"
+        _hint_bin2="${_hint_bin2:-/opt/xrpld/bin/xrpld}"
+        warn "  printf '[Service]\\nExecStart=\\nExecStart=${_hint_bin2} --conf /etc/opt/xrpld/xrpld.cfg\\n' \\"
         warn "    > /etc/systemd/system/xrpld.service.d/config.conf"
       fi
 
       if [[ -n "$XRPLD_CONFIG_FILE" && -n "$unit_file" && -f "$unit_file" ]]; then
         info "Patching unit file: ${unit_file}"
         cp -p "$unit_file" "${unit_file}.bak" 2>/dev/null || true
-        if grep -q '\-\-conf' "$unit_file"; then
-          # Replace existing --conf argument
-          sed -i "s|--conf [^ ]*|--conf ${XRPLD_CONFIG_FILE}|g" "$unit_file"
+        record_modified_file "$unit_file"
+        record_modified_file "${unit_file}.bak"
+
+        # Derive the actual xrpld binary path from ExecStart for use in hints
+        local xrpld_bin_in_unit
+        xrpld_bin_in_unit="$(grep -m1 '^[[:space:]]*ExecStart=' "$unit_file" \
+          | sed 's/^[[:space:]]*ExecStart=//' | awk '{print $1}')"
+        xrpld_bin_in_unit="${xrpld_bin_in_unit:-/usr/bin/xrpld}"
+
+        if grep -qE '\-\-conf[= ]' "$unit_file"; then
+          # Replace existing --conf argument — handles both "--conf /path" and "--conf=/path"
+          sed -i -e "s|--conf=[^ ]*|--conf ${XRPLD_CONFIG_FILE}|g" \
+                 -e "s|--conf [^ ]*|--conf ${XRPLD_CONFIG_FILE}|g" "$unit_file"
         else
-          # Fix 3 (B1): append --conf to ExecStart, then verify the sed actually matched
-          sed -i "s|\(ExecStart=.*xrpld\)|\1 --conf ${XRPLD_CONFIG_FILE}|g" "$unit_file"
+          # No --conf present: append it to the end of the ExecStart line.
+          # Using a line-anchored append avoids the greedy-match problem where
+          # "ExecStart=.*xrpld" could eat flags that follow the binary name
+          # (e.g. "--net --silent" in "/opt/xrpld/bin/xrpld --net --silent").
+          sed -i "/^[[:space:]]*ExecStart=/s|$| --conf ${XRPLD_CONFIG_FILE}|" "$unit_file"
           if ! grep -q '\-\-conf' "$unit_file"; then
             warn "Could not inject '--conf' into ExecStart in ${unit_file}."
             warn "ExecStart may reference a wrapper script rather than 'xrpld' directly."
             warn "Manually add '--conf ${XRPLD_CONFIG_FILE}' to ExecStart, or create a drop-in:"
             warn "  mkdir -p /etc/systemd/system/xrpld.service.d"
-            warn "  printf '[Service]\\nExecStart=\\nExecStart=/usr/bin/xrpld --conf ${XRPLD_CONFIG_FILE}\\n' \\"
+            warn "  printf '[Service]\\nExecStart=\\nExecStart=${xrpld_bin_in_unit} --conf ${XRPLD_CONFIG_FILE}\\n' \\"
             warn "    > /etc/systemd/system/xrpld.service.d/config.conf"
           fi
         fi
         # Confirm final ExecStart state (only print success when --conf is actually present)
-        if grep -q '\-\-conf' "$unit_file"; then
-          info "Unit ExecStart now uses config: ${XRPLD_CONFIG_FILE}"
-          record_change "UNIT PATCH" "Injected --conf ${XRPLD_CONFIG_FILE} into ${unit_file}"
+        if grep -qE '\-\-conf[= ]' "$unit_file"; then
+          local final_exec
+          final_exec="$(grep -m1 '^[[:space:]]*ExecStart=' "$unit_file" | sed 's/^[[:space:]]*ExecStart=//')"
+          info "Unit ExecStart updated: ${final_exec}"
+          record_change "UNIT PATCH" "Updated --conf to ${XRPLD_CONFIG_FILE} in ${unit_file}"
         fi
       elif [[ -z "$unit_file" ]]; then
         warn "Could not locate xrpld.service unit file to patch."
         warn "If xrpld fails to start, create a drop-in:"
         warn "  mkdir -p /etc/systemd/system/xrpld.service.d"
-        warn "  printf '[Service]\\nExecStart=\\nExecStart=/usr/bin/xrpld --conf ${XRPLD_CONFIG_FILE:-/etc/xrpld/xrpld.cfg}\\n' \\"
+        local _hint_bin="${xrpld_bin_in_unit:-/usr/bin/xrpld}"
+        warn "  printf '[Service]\\nExecStart=\\nExecStart=${_hint_bin} --conf ${XRPLD_CONFIG_FILE:-/etc/opt/xrpld/xrpld.cfg}\\n' \\"
         warn "    > /etc/systemd/system/xrpld.service.d/config.conf"
       fi
 
