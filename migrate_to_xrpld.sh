@@ -33,6 +33,9 @@
 #   --config-dir    Override the config file search directory.
 #   --scan-dir DIR  Add an extra directory to the filesystem rippled scan
 #                   (repeatable).
+#   --ignore FILE   Never modify FILE, even if it references rippled.
+#                   Use this to protect scripts or configs you want to keep
+#                   unchanged (repeatable).
 #
 # Exit codes:
 #   0   Success
@@ -57,6 +60,7 @@ NON_INTERACTIVE=false
 AUTO_MODE=false           # --auto: required changes only, no prompts
 OVERRIDE_CONFIG_DIR=""
 declare -a EXTRA_SCAN_DIRS=()
+declare -a IGNORE_FILES=()   # --ignore: paths the script must never modify
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,6 +70,8 @@ while [[ $# -gt 0 ]]; do
     --config-dir=*)    OVERRIDE_CONFIG_DIR="${1#*=}" ;;
     --scan-dir)        EXTRA_SCAN_DIRS+=("${2:-}"); shift ;;
     --scan-dir=*)      EXTRA_SCAN_DIRS+=("${1#*=}") ;;
+    --ignore)          IGNORE_FILES+=("${2:-}"); shift ;;
+    --ignore=*)        IGNORE_FILES+=("${1#*=}") ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,2\}//' | head -40
       exit 0 ;;
@@ -73,6 +79,19 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# ── is_ignored <path> — returns 0 (true) if the path is on the ignore list ───
+is_ignored() {
+  local target
+  target="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+  local f
+  for f in "${IGNORE_FILES[@]+"${IGNORE_FILES[@]}"}"; do
+    local canonical
+    canonical="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+    [[ "$target" == "$canonical" ]] && return 0
+  done
+  return 1
+}
 
 # ── Resolve this script's own real path so the filesystem scan can skip it ────
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null \
@@ -985,13 +1004,14 @@ scan_directory() {
   info "Scanning ${label} (${scan_dir})..."
 
   # Build skip-list: this script itself, files previously modified by this script,
-  # and files already handled by dedicated migration steps (logrotate, cron, monitoring).
+  # files already handled by dedicated migration steps, and user-ignored files.
   local -a already_handled=()
   [[ -n "$SCRIPT_SELF"    ]] && already_handled+=("$SCRIPT_SELF")
   already_handled+=("${SCRIPT_MODIFIED_FILES[@]}")
   [[ -n "$LOGROTATE_FILE" ]] && already_handled+=("$LOGROTATE_FILE")
   already_handled+=("${CRON_FILES_WITH_RIPPLED[@]}")
   already_handled+=("${MONITORING_FILES_WITH_RIPPLED[@]}")
+  already_handled+=("${IGNORE_FILES[@]+"${IGNORE_FILES[@]}"}")
 
   local skip_ext_re='(\.pyc|\.pyo|\.so(\.[0-9]+)*|\.a|\.o|\.rpm|\.deb|\.png|\.jpg|\.gif|\.svg|\.gz|\.bz2|\.xz|\.zip|\.tar|\.jar|\.war|\.class|\.mo|\.pot)$'
 
@@ -2067,25 +2087,41 @@ migrate_cron_jobs() {
 
   for f in "${CRON_FILES_WITH_RIPPLED[@]}"; do
     [[ -f "$f" ]] || continue
+    if is_ignored "$f"; then
+      info "  Skipped (--ignore): ${f}"
+      continue
+    fi
 
     info "Updating: ${f}"
-    # Back up first
     cp -p "$f" "${f}.bak-rippled" \
       && info "  Backed up as ${f}.bak-rippled"
 
-    # Replace 'rippled' with 'xrpld' – avoid replacing inside URLs or unrelated words
-    # Using word-boundary aware sed substitution
-    sed -i.tmp \
-      -e 's|\brippled\b|xrpld|g' \
-      -e 's|rippled\.cfg|xrpld.cfg|g' \
-      "$f" && rm -f "${f}.tmp"
+    env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
+    perl -i -pe '
+      my $conf = $ENV{XRPLD_CONF} // "";
+      # 1. Rename full-path binary references
+      s{(/[a-zA-Z0-9._/-]+/)(rippled)\b}{$1xrpld}g;
+      # 2. Rename bare rippled → xrpld
+      s{(?<!/)\brippled\b}{xrpld}g;
+      if ($conf) {
+        # 3. Update existing --conf path
+        s{--conf[= ]\S+}{--conf $conf}g;
+        # 4. Add --conf to invocation lines without it (skip comments)
+        unless (/^\s*#/ || /--conf/) {
+          if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b/ ||
+              /(?:^|\s|[|;&`(])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b/) {
+            s{((?:\/\S*\/)?xrpld)\b}{$1 --conf $conf};
+          }
+        }
+      }
+    ' "$f"
 
     if command -v diff &>/dev/null; then
       diff "${f}.bak-rippled" "$f" || true
     fi
 
     success "  ${f} updated."
-    record_change "CRON" "rippled → xrpld in ${f}"
+    record_change "CRON" "rippled → xrpld + --conf patched in ${f}"
     record_modified_file "$f"
     record_modified_file "${f}.bak-rippled"
   done
@@ -2106,22 +2142,41 @@ migrate_monitoring_configs() {
 
   for f in "${MONITORING_FILES_WITH_RIPPLED[@]}"; do
     [[ -f "$f" ]] || continue
+    if is_ignored "$f"; then
+      info "  Skipped (--ignore): ${f}"
+      continue
+    fi
 
     info "Updating: ${f}"
     cp -p "$f" "${f}.bak-rippled" \
       && info "  Backed up as ${f}.bak-rippled"
 
-    sed -i.tmp \
-      -e 's|\brippled\b|xrpld|g' \
-      -e 's|rippled\.cfg|xrpld.cfg|g' \
-      "$f" && rm -f "${f}.tmp"
+    env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
+    perl -i -pe '
+      my $conf = $ENV{XRPLD_CONF} // "";
+      # 1. Rename full-path binary references
+      s{(/[a-zA-Z0-9._/-]+/)(rippled)\b}{$1xrpld}g;
+      # 2. Rename bare rippled → xrpld
+      s{(?<!/)\brippled\b}{xrpld}g;
+      if ($conf) {
+        # 3. Update existing --conf path
+        s{--conf[= ]\S+}{--conf $conf}g;
+        # 4. Add --conf to invocation lines without it (skip comments)
+        unless (/^\s*#/ || /--conf/) {
+          if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b/ ||
+              /(?:^|\s|[|;&`(])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b/) {
+            s{((?:\/\S*\/)?xrpld)\b}{$1 --conf $conf};
+          }
+        }
+      }
+    ' "$f"
 
     if command -v diff &>/dev/null; then
       diff "${f}.bak-rippled" "$f" || true
     fi
 
     success "  ${f} updated."
-    record_change "MONITORING" "rippled → xrpld in ${f}"
+    record_change "MONITORING" "rippled → xrpld + --conf patched in ${f}"
     record_modified_file "$f"
     record_modified_file "${f}.bak-rippled"
   done
@@ -2245,6 +2300,10 @@ header "Applying scan fixes"
 apply_fix() {
   local filepath="$1"; shift   # remaining args are sed/perl expressions
   [[ -f "$filepath" ]] || return
+  if is_ignored "$filepath"; then
+    info "  Skipped (--ignore): ${filepath}"
+    return 0
+  fi
   [[ -f "${filepath}.bak-rippled" ]] || \
     cp -p "$filepath" "${filepath}.bak-rippled" 2>/dev/null || true
   "$@" && true   # caller passes the actual command
@@ -2277,17 +2336,32 @@ migrate_scan_results() {
     info "No process/service name references to fix."
   fi
 
-  # ── SCRIPT CALL refs — scripts invoking rippled: rename command + path ─────
+  # ── SCRIPT CALL refs — scripts invoking rippled: rename command + --conf ─────
   if [[ $total_script -gt 0 ]]; then
     info "Fixing script invocation refs in ${total_script} file(s)..."
     for filepath in "${!SCAN_SCRIPT_REFS[@]}"; do
       apply_fix "$filepath" \
+        env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
         perl -i -pe '
-          s{(/[a-zA-Z0-9._/-]*/)(rippled)\b}{$1xrpld}g;
+          my $conf = $ENV{XRPLD_CONF} // "";
+          # 1. Rename full-path binary references
+          s{(/[a-zA-Z0-9._/-]+/)(rippled)\b}{$1xrpld}g;
+          # 2. Rename bare rippled → xrpld (not inside a path)
           s{(?<!/)\brippled\b}{xrpld}g;
+          if ($conf) {
+            # 3. Update existing --conf path to the correct location
+            s{--conf[= ]\S+}{--conf $conf}g;
+            # 4. Add --conf to invocation lines that do not already have it.
+            #    Condition: not a comment, line contains xrpld as a command token.
+            unless (/^\s*#/ || /--conf/) {
+              if (/(?:^|\s|[=|;&`(])(?:\/\S+\/)?xrpld\b/) {
+                s{((?:\/\S*\/)?xrpld)\b}{$1 --conf $conf};
+              }
+            }
+          }
         ' "$filepath" \
         && { success "  Fixed: ${filepath}"
-             record_change "SCRIPT" "rippled → xrpld in ${filepath}"
+             record_change "SCRIPT" "rippled → xrpld + --conf patched in ${filepath}"
              record_modified_file "$filepath"
              record_modified_file "${filepath}.bak-rippled"; } \
         || warn    "  Could not fix: ${filepath} — edit manually"
