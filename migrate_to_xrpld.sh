@@ -943,19 +943,43 @@ classify_line() {
     return
   fi
 
-  # ── SCRIPT CALL — invocation patterns in executable scripts ───────────────
-  # Catches:
-  #   rippled <args>           bare command call
-  #   $(rippled …)             command substitution
-  #   `rippled …`              backtick substitution
-  #   exec rippled             exec call
-  #   /path/to/rippled         hard-coded binary path (any location)
-  #   VARNAME=…rippled         variable assignment pointing at binary
-  #   VARNAME="rippled"        variable holding daemon name
+  # ── SCRIPT CALL — classify the line's relationship to rippled ───────────────
+  # We tag each match so the output tells the operator exactly what was found:
+  #
+  #   [INVOKE]  — high-confidence command invocation:
+  #                 exec rippled, $(rippled …), `rippled …`,
+  #                 /path/to/rippled, rippled at start of non-comment line
+  #   [VAR_DEF] — variable or config assignment whose value is the binary name:
+  #                 VARNAME=rippled  VARNAME="rippled"  VARNAME='/path/rippled'
+  #   [NAME_REF]— bare word reference that is NOT an invocation and NOT a
+  #                 variable definition (e.g. a string arg, a comment word,
+  #                 a function argument): rename is still correct but no --conf
+  #
+  # Limitations: without a full language parser we cannot distinguish a
+  # variable named 'rippled' (coincidental) from one that holds the binary.
+  # Word boundaries already protect compound names like rippled_command.
+  # Use --ignore for files where any rename would be wrong.
   if $is_script; then
+    local _tag=""
+    # Invocation: explicit invocation keywords, command substitution, full path
+    # (checked first — these are unambiguous regardless of surrounding context)
     if echo "$content" | grep -qE \
-      '(^\s*(exec\s+|command\s+)?\brippled\b|\$\(.*\brippled\b|\`.*\brippled\b|[A-Z_]+=.*\brippled\b|/[a-zA-Z0-9._/-]*/rippled\b)'; then
-      SCAN_SCRIPT_REFS["$filepath"]+="${lineno}: ${content}"$'\n'
+      '(^\s*(exec|command|sudo|nohup|nice|timeout|runuser|su\s+-[a-z]*\s+\S+\s+-c)\s+.*\brippled\b|\$\(.*\brippled\b|\`.*\brippled\b|/[a-zA-Z0-9._/-]*/rippled\b)'; then
+      _tag="[INVOKE]"
+    # Variable / config assignment — must come BEFORE the bare-invocation check
+    # because  "rippled = 'curl'"  starts with rippled and would otherwise be
+    # mis-classified as an invocation.
+    # Pattern: any identifier followed by = or : then optional quote then rippled
+    elif echo "$content" | grep -qE \
+      '(^\s*[A-Za-z_][A-Za-z0-9_]*\s*[=:])|(^\s*\brippled\b\s*[=:])'; then
+      _tag="[VAR_DEF]"
+    # Invocation: bare rippled at the start of a non-comment line followed by
+    # at least one argument (and NOT an assignment, which was caught above)
+    elif echo "$content" | grep -qE '^\s*\brippled\b\s+\S'; then
+      _tag="[INVOKE]"
+    fi
+    if [[ -n "$_tag" ]]; then
+      SCAN_SCRIPT_REFS["$filepath"]+="${lineno}${_tag}: ${content}"$'\n'
       return
     fi
   fi
@@ -2400,6 +2424,20 @@ migrate_scan_results() {
   if [[ $total_script -gt 0 ]]; then
     info "Fixing script invocation refs in ${total_script} file(s)..."
     for filepath in "${!SCAN_SCRIPT_REFS[@]}"; do
+      # Show the operator what type of reference was detected on each matched line
+      echo ""
+      info "  ${filepath} — matched lines:"
+      while IFS= read -r ln; do
+        [[ -z "$ln" ]] && continue
+        if [[ "$ln" == *"[INVOKE]"* ]]; then
+          echo -e "    ${GREEN}${ln}${RESET}   ← command invocation (rename + --conf)"
+        elif [[ "$ln" == *"[VAR_DEF]"* ]]; then
+          echo -e "    ${YELLOW}${ln}${RESET}   ← variable/config assignment (rename only)"
+        else
+          echo -e "    ${CYAN}${ln}${RESET}   ← name reference (rename only)"
+        fi
+      done <<< "${SCAN_SCRIPT_REFS[$filepath]}"
+      echo ""
       apply_fix "$filepath" \
         env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
             XRPLD_OLD_BIN="$RIPPLED_BIN" \
