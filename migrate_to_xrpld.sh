@@ -374,6 +374,7 @@ header "Detecting rippled installation"
 
 INSTALL_METHOD=""   # rpm | deb | binary | homebrew | not_found
 RIPPLED_BIN=""
+XRPLD_BIN=""        # resolved after install_xrpld() runs
 RIPPLED_PKG_NAME="rippled"
 
 detect_installation() {
@@ -1631,14 +1632,23 @@ EOF
       ;;
   esac
 
-  # Verify
-  local xrpld_bin
-  xrpld_bin="$(command -v xrpld 2>/dev/null || true)"
-  [[ -z "$xrpld_bin" ]] && die "xrpld binary not found in PATH after install."
+  # Verify and record the real binary path globally so later steps can use it
+  # when rewriting hardcoded paths in scripts and monitoring configs.
+  local xrpld_bin_found
+  xrpld_bin_found="$(command -v xrpld 2>/dev/null || true)"
+  # Also check the known install prefix in case PATH isn't updated yet
+  if [[ -z "$xrpld_bin_found" ]]; then
+    for _p in /opt/xrpld/bin/xrpld /opt/ripple/bin/xrpld /usr/bin/xrpld \
+              /usr/local/bin/xrpld; do
+      [[ -x "$_p" ]] && { xrpld_bin_found="$_p"; break; }
+    done
+  fi
+  [[ -z "$xrpld_bin_found" ]] && die "xrpld binary not found in PATH after install."
+  XRPLD_BIN="$(readlink -f "$xrpld_bin_found" 2>/dev/null || echo "$xrpld_bin_found")"
   local xver
-  xver="$("$xrpld_bin" --version 2>/dev/null | head -1 || echo 'unknown')"
-  success "xrpld installed: ${xrpld_bin}  (${xver})"
-  record_change "INSTALL" "xrpld installed via ${PKG_MANAGER}: ${xrpld_bin} ${xver}"
+  xver="$("$XRPLD_BIN" --version 2>/dev/null | head -1 || echo 'unknown')"
+  success "xrpld installed: ${XRPLD_BIN}  (${xver})"
+  record_change "INSTALL" "xrpld installed via ${PKG_MANAGER}: ${XRPLD_BIN} ${xver}"
 }
 
 install_xrpld
@@ -2097,20 +2107,45 @@ migrate_cron_jobs() {
       && info "  Backed up as ${f}.bak-rippled"
 
     env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
+        XRPLD_OLD_BIN="$RIPPLED_BIN" \
+        XRPLD_NEW_BIN="$XRPLD_BIN" \
     perl -i -pe '
-      my $conf = $ENV{XRPLD_CONF} // "";
-      # 1. Rename full-path binary references
+      my $conf    = $ENV{XRPLD_CONF}    // "";
+      my $old_bin = $ENV{XRPLD_OLD_BIN} // "";
+      my $new_bin = $ENV{XRPLD_NEW_BIN} // "";
+      # 1a. Exact old-binary-path → new-binary-path (highest priority).
+      #     Handles the case where the old path (e.g. /opt/ripple/bin/rippled)
+      #     and the new path (e.g. /opt/xrpld/bin/xrpld) differ beyond just the
+      #     filename, so a simple rename would produce a non-existent path.
+      if ($old_bin && $new_bin && $old_bin ne "(not resolved)" && $old_bin ne "(already removed)") {
+        (my $old_esc = $old_bin) =~ s{[/.]}{\\$&}g;
+        s{\Q$old_bin\E}{$new_bin}g;
+      }
+      # 1b. Any remaining /path/to/rippled binary reference → /path/to/xrpld
+      #     (catches non-standard install paths not covered by 1a)
       s{(/[a-zA-Z0-9._/-]+/)(rippled)\b}{$1xrpld}g;
-      # 2. Rename bare rippled → xrpld
+      # 2. Rename bare rippled → xrpld (service names, env vars, etc.)
       s{(?<!/)\brippled\b}{xrpld}g;
+      # 2b. Rename ripple:: namespace → xrpl:: (C++ / Python class references,
+      #     e.g. ripple::Ledger, ripple::STTx, ripple::HashRouter::Entry)
+      s{\bripple::}{xrpl::}g;
       if ($conf) {
-        # 3. Update existing --conf path
+        # 3. Update existing --conf path to the correct location
         s{--conf[= ]\S+}{--conf $conf}g;
-        # 4. Add --conf to invocation lines without it (skip comments)
+        # 4. Add --conf to invocation lines that do not already have it.
+        #    Skip comment lines; only match actual command invocations.
         unless (/^\s*#/ || /--conf/) {
-          if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b/ ||
-              /(?:^|\s|[|;&`(])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b/) {
-            s{((?:\/\S*\/)?xrpld)\b}{$1 --conf $conf};
+          # Negative lookahead (?!\s*[=:,)]) excludes:
+          #   =  — assignment:      xrpld = 'curl'
+          #   :  — YAML key:        binary: xrpld
+          #   ,  — function arg:    format(xrpld, ...)
+          #   )  — function arg:    run(xrpld)
+          # ( is intentionally NOT in the prefix class: it would match Python
+          # function-call parentheses and produce false positives like
+          # format(xrpld --conf ..., ...).
+          if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b(?!\s*[=:,)])/ ||
+              /(?:^|\s|[|;&`])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b(?!\s*[=:,)])/) {
+            s{((?:\/\S*\/)?xrpld)\b(?!\s*[=:,)])}{$1 --conf $conf};
           }
         }
       }
@@ -2152,20 +2187,45 @@ migrate_monitoring_configs() {
       && info "  Backed up as ${f}.bak-rippled"
 
     env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
+        XRPLD_OLD_BIN="$RIPPLED_BIN" \
+        XRPLD_NEW_BIN="$XRPLD_BIN" \
     perl -i -pe '
-      my $conf = $ENV{XRPLD_CONF} // "";
-      # 1. Rename full-path binary references
+      my $conf    = $ENV{XRPLD_CONF}    // "";
+      my $old_bin = $ENV{XRPLD_OLD_BIN} // "";
+      my $new_bin = $ENV{XRPLD_NEW_BIN} // "";
+      # 1a. Exact old-binary-path → new-binary-path (highest priority).
+      #     Handles the case where the old path (e.g. /opt/ripple/bin/rippled)
+      #     and the new path (e.g. /opt/xrpld/bin/xrpld) differ beyond just the
+      #     filename, so a simple rename would produce a non-existent path.
+      if ($old_bin && $new_bin && $old_bin ne "(not resolved)" && $old_bin ne "(already removed)") {
+        (my $old_esc = $old_bin) =~ s{[/.]}{\\$&}g;
+        s{\Q$old_bin\E}{$new_bin}g;
+      }
+      # 1b. Any remaining /path/to/rippled binary reference → /path/to/xrpld
+      #     (catches non-standard install paths not covered by 1a)
       s{(/[a-zA-Z0-9._/-]+/)(rippled)\b}{$1xrpld}g;
-      # 2. Rename bare rippled → xrpld
+      # 2. Rename bare rippled → xrpld (service names, env vars, etc.)
       s{(?<!/)\brippled\b}{xrpld}g;
+      # 2b. Rename ripple:: namespace → xrpl:: (C++ / Python class references,
+      #     e.g. ripple::Ledger, ripple::STTx, ripple::HashRouter::Entry)
+      s{\bripple::}{xrpl::}g;
       if ($conf) {
-        # 3. Update existing --conf path
+        # 3. Update existing --conf path to the correct location
         s{--conf[= ]\S+}{--conf $conf}g;
-        # 4. Add --conf to invocation lines without it (skip comments)
+        # 4. Add --conf to invocation lines that do not already have it.
+        #    Skip comment lines; only match actual command invocations.
         unless (/^\s*#/ || /--conf/) {
-          if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b/ ||
-              /(?:^|\s|[|;&`(])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b/) {
-            s{((?:\/\S*\/)?xrpld)\b}{$1 --conf $conf};
+          # Negative lookahead (?!\s*[=:,)]) excludes:
+          #   =  — assignment:      xrpld = 'curl'
+          #   :  — YAML key:        binary: xrpld
+          #   ,  — function arg:    format(xrpld, ...)
+          #   )  — function arg:    run(xrpld)
+          # ( is intentionally NOT in the prefix class: it would match Python
+          # function-call parentheses and produce false positives like
+          # format(xrpld --conf ..., ...).
+          if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b(?!\s*[=:,)])/ ||
+              /(?:^|\s|[|;&`])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b(?!\s*[=:,)])/) {
+            s{((?:\/\S*\/)?xrpld)\b(?!\s*[=:,)])}{$1 --conf $conf};
           }
         }
       }
@@ -2325,7 +2385,7 @@ migrate_scan_results() {
     for filepath in "${!SCAN_NAME_REFS[@]}"; do
       # Negative lookbehind for '/' so we never touch path components
       apply_fix "$filepath" \
-        perl -i -pe 's{(?<!/)\brippled\b}{xrpld}g' "$filepath" \
+        perl -i -pe 's{(?<!/)\brippled\b}{xrpld}g; s{\bripple::}{xrpl::}g' "$filepath" \
         && { success "  Fixed: ${filepath}"
              record_change "NAME REF" "rippled → xrpld in ${filepath}"
              record_modified_file "$filepath"
@@ -2342,19 +2402,29 @@ migrate_scan_results() {
     for filepath in "${!SCAN_SCRIPT_REFS[@]}"; do
       apply_fix "$filepath" \
         env XRPLD_CONF="$XRPLD_CONFIG_FILE" \
+            XRPLD_OLD_BIN="$RIPPLED_BIN" \
+            XRPLD_NEW_BIN="$XRPLD_BIN" \
         perl -i -pe '
-          my $conf = $ENV{XRPLD_CONF} // "";
-          # 1. Rename full-path binary references
+          my $conf    = $ENV{XRPLD_CONF}    // "";
+          my $old_bin = $ENV{XRPLD_OLD_BIN} // "";
+          my $new_bin = $ENV{XRPLD_NEW_BIN} // "";
+          # 1a. Exact old-binary-path → new-binary-path
+          if ($old_bin && $new_bin && $old_bin ne "(not resolved)" && $old_bin ne "(already removed)") {
+            s{\Q$old_bin\E}{$new_bin}g;
+          }
+          # 1b. Any remaining /path/to/rippled → /path/to/xrpld
           s{(/[a-zA-Z0-9._/-]+/)(rippled)\b}{$1xrpld}g;
           # 2. Rename bare rippled → xrpld (not inside a path)
           s{(?<!/)\brippled\b}{xrpld}g;
+          # 2b. Rename ripple:: namespace → xrpl::
+          s{\bripple::}{xrpl::}g;
           if ($conf) {
             # 3. Update existing --conf path to the correct location
             s{--conf[= ]\S+}{--conf $conf}g;
             # 4. Add --conf to invocation lines that do not already have it.
-            #    Condition: not a comment, line contains xrpld as a command token.
             unless (/^\s*#/ || /--conf/) {
-              if (/(?:^|\s|[=|;&`(])(?:\/\S+\/)?xrpld\b/) {
+              if (/ExecStart\s*=\s*(?:\/\S+\/)?xrpld\b/ ||
+                  /(?:^|\s|[|;&`(])(?:exec\s+|sudo\s+|nohup\s+|command\s+)?(?:\/\S+\/)?xrpld\b/) {
                 s{((?:\/\S*\/)?xrpld)\b}{$1 --conf $conf};
               }
             }
@@ -2424,7 +2494,7 @@ migrate_scan_results() {
 
         if ask_yes_no "  Replace 'rippled' → 'xrpld' in ${filepath}?" no; then
           apply_fix "$filepath" \
-            perl -i -pe 's{(?<!/)\brippled\b}{xrpld}g' "$filepath" \
+            perl -i -pe 's{(?<!/)\brippled\b}{xrpld}g; s{\bripple::}{xrpl::}g' "$filepath" \
             && { success "  Fixed: ${filepath}"
                  record_change "UNKNOWN FIX" "rippled → xrpld in ${filepath}"
                  record_modified_file "$filepath"
